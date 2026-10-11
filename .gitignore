@@ -1,0 +1,13 @@
+# Segredos
+.env
+traefik/auth/htpasswd
+
+# Certificados e chaves (gerados por scripts/gen-certs.sh)
+certs/*
+!certs/.gitkeep
+
+# Editores / SO
+.vscode/
+.idea/
+*.swp
+.DS_Store

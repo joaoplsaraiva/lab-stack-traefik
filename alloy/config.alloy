@@ -1,0 +1,50 @@
+// =============================================================================
+// Grafana Alloy - coleta de logs dos containers Docker
+// Docker API (via socket-proxy, somente leitura) -> Alloy -> Loki
+// =============================================================================
+
+// Descobre os containers em execução através do Socket Proxy
+discovery.docker "containers" {
+  host             = "tcp://socket-proxy:2375"
+  refresh_interval = "15s"
+}
+
+// Labels aplicados em cada stream de log
+discovery.relabel "containers" {
+  targets = []
+
+  // "/traefik" -> service_name="traefik"
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "service_name"
+  }
+
+  // Projeto/serviço do Docker Compose
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+
+  // Label fixo para identificar a origem
+  rule {
+    target_label = "platform"
+    replacement  = "docker"
+  }
+}
+
+// Lê stdout/stderr dos containers
+loki.source.docker "containers" {
+  host             = "tcp://socket-proxy:2375"
+  targets          = discovery.docker.containers.targets
+  relabel_rules    = discovery.relabel.containers.rules
+  refresh_interval = "15s"
+  forward_to       = [loki.write.default.receiver]
+}
+
+// Envia para o Loki
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

@@ -1,0 +1,34 @@
+# ==============================================================================
+# Configuração dinâmica do Traefik (file provider)
+# Certificados emitidos pela CA local (scripts/gen-certs.sh) + TLS hardening
+# ==============================================================================
+tls:
+  certificates:
+    - certFile: /certs/server.crt
+      keyFile: /certs/server.key
+
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/server.crt
+        keyFile: /certs/server.key
+
+  options:
+    # Aplicada explicitamente em cada router: tls.options=tls-hardening@file
+    tls-hardening:
+      minVersion: VersionTLS12
+      # Rejeita handshakes cujo SNI não corresponda a um certificado conhecido
+      sniStrict: true
+      # Apenas AEAD + Forward Secrecy (válido para TLS 1.2;
+      # TLS 1.3 usa suítes próprias, sempre seguras)
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      curvePreferences:
+        - X25519
+        - CurveP384
+        - CurveP256

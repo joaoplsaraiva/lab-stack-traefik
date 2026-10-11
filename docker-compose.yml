@@ -1,0 +1,363 @@
+# ==============================================================================
+# lab-stack-traefik
+#
+# Reverse proxy seguro com Traefik v3 + stack de observabilidade completa
+# (métricas, logs e traces) em Docker Compose.
+#
+# Regra de ouro do projeto: SOMENTE o Traefik publica portas no host (80/443).
+# Todos os outros serviços são acessados exclusivamente através dele.
+# ==============================================================================
+
+name: lab-stack-traefik
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+
+services:
+
+  # ============================================================================
+  # DOCKER SOCKET PROXY
+  # Intermediário somente leitura entre a API do Docker e Traefik/Alloy.
+  # Libera apenas o mínimo necessário para descoberta de containers e logs.
+  # ============================================================================
+  socket-proxy:
+    <<: *hardening
+    image: ${SOCKET_PROXY_IMAGE:-tecnativa/docker-socket-proxy:latest}
+    container_name: socket-proxy
+    environment:
+      # Permitido (somente leitura / GET)
+      - CONTAINERS=1
+      - EVENTS=1
+      - PING=1
+      - VERSION=1
+      # Explicitamente negado
+      - POST=0
+      - EXEC=0
+      - IMAGES=0
+      - NETWORKS=0
+      - VOLUMES=0
+      - SERVICES=0
+      - TASKS=0
+      - NODES=0
+      - SWARM=0
+      - SECRETS=0
+      - CONFIGS=0
+      - BUILD=0
+      - COMMIT=0
+      - AUTH=0
+      - SYSTEM=0
+      - INFO=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket-proxy
+    # NÃO publicar a porta 2375 no host.
+
+  # ============================================================================
+  # TRAEFIK - Reverse proxy / TLS / Middlewares / Métricas / Tracing
+  # ============================================================================
+  traefik:
+    <<: *hardening
+    image: ${TRAEFIK_IMAGE:-traefik:v3.7}
+    container_name: traefik
+    depends_on:
+      - socket-proxy
+    command:
+      # ---------------- API / Dashboard (seguro) ----------------
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--ping=true"
+
+      # ---------------- Providers ----------------
+      # Docker via Socket Proxy (sem montar o docker.sock no Traefik)
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=proxy"
+      # Arquivos dinâmicos (TLS, certificados, opções)
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+
+      # ---------------- EntryPoints ----------------
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Redirect permanente HTTP -> HTTPS
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      # EntryPoint interno de métricas (não publicado no host)
+      - "--entrypoints.metrics.address=:8082"
+
+      # ---------------- Métricas (Prometheus) ----------------
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entrypoint=metrics"
+      - "--metrics.prometheus.addentrypointslabels=true"
+      - "--metrics.prometheus.addrouterslabels=true"
+      - "--metrics.prometheus.addserviceslabels=true"
+
+      # ---------------- Tracing (OpenTelemetry -> Jaeger) ----------------
+      - "--tracing.serviceName=traefik"
+      - "--tracing.sampleRate=1.0"
+      - "--tracing.otlp.http.endpoint=http://jaeger:4318/v1/traces"
+
+      # ---------------- Logs ----------------
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+      - "--accesslog=true"
+      - "--accesslog.format=json"
+      - "--accesslog.fields.headers.defaultmode=drop"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+      - ./traefik/auth:/auth:ro
+    networks:
+      - proxy
+      - socket-proxy
+      - monitoring
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "traefik.enable=true"
+
+      # ---------------- Middleware: BasicAuth ----------------
+      # Hash bcrypt gerado por scripts/gen-htpasswd.sh (fora do Git)
+      - "traefik.http.middlewares.traefik-auth.basicauth.usersfile=/auth/htpasswd"
+
+      # ---------------- Middleware: Security Headers ----------------
+      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=false"
+      - "traefik.http.middlewares.security-headers.headers.stsPreload=false"
+      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.security-headers.headers.frameDeny=true"
+      - "traefik.http.middlewares.security-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
+      - "traefik.http.middlewares.security-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+      - "traefik.http.middlewares.security-headers.headers.contentSecurityPolicy=frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+      - "traefik.http.middlewares.security-headers.headers.customResponseHeaders.X-Powered-By="
+
+      # ---------------- Middlewares: Rate Limit (token bucket) ----------------
+      - "traefik.http.middlewares.dashboard-ratelimit.ratelimit.average=10"
+      - "traefik.http.middlewares.dashboard-ratelimit.ratelimit.period=1s"
+      - "traefik.http.middlewares.dashboard-ratelimit.ratelimit.burst=20"
+
+      - "traefik.http.middlewares.whoami-ratelimit.ratelimit.average=10"
+      - "traefik.http.middlewares.whoami-ratelimit.ratelimit.period=1s"
+      - "traefik.http.middlewares.whoami-ratelimit.ratelimit.burst=20"
+
+      - "traefik.http.middlewares.portainer-ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.portainer-ratelimit.ratelimit.period=1s"
+      - "traefik.http.middlewares.portainer-ratelimit.ratelimit.burst=40"
+
+      # ---------------- Router: Dashboard do Traefik ----------------
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls=true"
+      - "traefik.http.routers.traefik.tls.options=tls-hardening@file"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=security-headers@docker,dashboard-ratelimit@docker,traefik-auth@docker"
+
+  # ============================================================================
+  # WHOAMI - Aplicação de teste de roteamento
+  # ============================================================================
+  whoami:
+    <<: *hardening
+    image: ${WHOAMI_IMAGE:-traefik/whoami:latest}
+    container_name: whoami
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.whoami.rule=Host(`whoami.${DOMAIN}`)"
+      - "traefik.http.routers.whoami.entrypoints=websecure"
+      - "traefik.http.routers.whoami.tls=true"
+      - "traefik.http.routers.whoami.tls.options=tls-hardening@file"
+      - "traefik.http.routers.whoami.middlewares=security-headers@docker,whoami-ratelimit@docker"
+      - "traefik.http.services.whoami.loadbalancer.server.port=80"
+
+  # ============================================================================
+  # PORTAINER - Gestão do Docker Engine
+  # Obs.: usa o docker.sock diretamente (precisa de escrita para administrar).
+  # ============================================================================
+  portainer:
+    <<: *hardening
+    image: ${PORTAINER_IMAGE:-portainer/portainer-ce:lts}
+    container_name: portainer
+    command:
+      - "-H"
+      - "unix:///var/run/docker.sock"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.${DOMAIN}`)"
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls=true"
+      - "traefik.http.routers.portainer.tls.options=tls-hardening@file"
+      - "traefik.http.routers.portainer.service=portainer"
+      - "traefik.http.routers.portainer.middlewares=security-headers@docker,portainer-ratelimit@docker"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+  # ============================================================================
+  # JAEGER v2 - Traces (recebe OTLP do Traefik)
+  # ============================================================================
+  jaeger:
+    <<: *hardening
+    image: ${JAEGER_IMAGE:-jaegertracing/jaeger:2.20.0}
+    container_name: jaeger
+    networks:
+      - proxy
+      - monitoring
+    # OTLP :4317/:4318 e UI :16686 apenas na rede interna (sem ports:)
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.jaeger.rule=Host(`jaeger.${DOMAIN}`)"
+      - "traefik.http.routers.jaeger.entrypoints=websecure"
+      - "traefik.http.routers.jaeger.tls=true"
+      - "traefik.http.routers.jaeger.tls.options=tls-hardening@file"
+      - "traefik.http.routers.jaeger.middlewares=security-headers@docker,traefik-auth@docker"
+      - "traefik.http.services.jaeger.loadbalancer.server.port=16686"
+
+  # ============================================================================
+  # PROMETHEUS - Métricas
+  # ============================================================================
+  prometheus:
+    <<: *hardening
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - proxy
+      - monitoring
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.${DOMAIN}`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.tls=true"
+      - "traefik.http.routers.prometheus.tls.options=tls-hardening@file"
+      - "traefik.http.routers.prometheus.middlewares=security-headers@docker,traefik-auth@docker"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+
+  # ============================================================================
+  # LOKI - Armazenamento de logs (somente rede interna)
+  # ============================================================================
+  loki:
+    <<: *hardening
+    image: ${LOKI_IMAGE:-grafana/loki:3.5.0}
+    container_name: loki
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    networks:
+      - monitoring
+
+  # ============================================================================
+  # GRAFANA ALLOY - Coleta logs dos containers (via Socket Proxy) -> Loki
+  # ============================================================================
+  alloy:
+    <<: *hardening
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.10.0}
+    container_name: alloy
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+    networks:
+      - socket-proxy
+      - monitoring
+    depends_on:
+      - socket-proxy
+      - loki
+
+  # ============================================================================
+  # GRAFANA - Visualização (Prometheus + Loki + Jaeger)
+  # ============================================================================
+  grafana:
+    <<: *hardening
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.2.1}
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Defina GRAFANA_ADMIN_PASSWORD no .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://grafana.${DOMAIN}
+      # O BasicAuth fica no Traefik; evita conflito do header Authorization
+      - GF_AUTH_BASIC_ENABLED=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - proxy
+      - monitoring
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.tls.options=tls-hardening@file"
+      - "traefik.http.routers.grafana.middlewares=security-headers@docker,traefik-auth@docker"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+# ==============================================================================
+# NETWORKS
+# ==============================================================================
+networks:
+  # Tráfego HTTP entre Traefik e as aplicações publicadas
+  proxy:
+    name: proxy
+    driver: bridge
+  # Acesso à API do Docker (somente Traefik e Alloy) - sem saída externa
+  socket-proxy:
+    name: socket-proxy
+    driver: bridge
+    internal: true
+  # Telemetria: métricas, logs e traces - sem saída externa
+  monitoring:
+    name: monitoring
+    driver: bridge
+    internal: true
+
+# ==============================================================================
+# VOLUMES
+# ==============================================================================
+volumes:
+  portainer_data:
+    name: portainer_data
+  prometheus_data:
+    name: prometheus_data
+  loki_data:
+    name: loki_data
+  alloy_data:
+    name: alloy_data
+  grafana_data:
+    name: grafana_data
